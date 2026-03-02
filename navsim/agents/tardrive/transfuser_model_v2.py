@@ -3,15 +3,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import copy
-from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
-from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
-from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
+from navsim.agents.tardrive.transfuser_config import TransfuserConfig
+from navsim.agents.tardrive.transfuser_backbone import TransfuserBackbone
+from navsim.agents.tardrive.transfuser_features import BoundingBox2DIndex
 from navsim.common.enums import StateSE2Index
 from diffusers.schedulers import DDIMScheduler
-from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalUnet1D,SinusoidalPosEmb
+from navsim.agents.tardrive.modules.conditional_unet1d import ConditionalUnet1D,SinusoidalPosEmb
 import torch.nn.functional as F
-from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
-from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.tardrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
+from navsim.agents.tardrive.modules.multimodal_loss import LossComputer
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -113,7 +113,7 @@ class V2TransfuserModel(nn.Module):
         keyval += self._keyval_embedding.weight[None, ...]
 
         concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
-        # upsample to the same shape as bev_feature_upscales
+        # upsample to the same shape as bev_feature_upscale
 
         concat_cross_bev = F.interpolate(concat_cross_bev, size=bev_spatial_shape, mode='bilinear', align_corners=False)
         # concat concat_cross_bev and cross_bev_feature
@@ -124,10 +124,10 @@ class V2TransfuserModel(nn.Module):
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
         query_out = self._tf_decoder(query, keyval)
 
-        bev_semantic_map = self._bev_semantic_head(bev_feature_upscale) #这东西不拿去监督？
+        bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
         trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
 
-        output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map} #这是一个bev_semantic_map的分割结果
+        output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
         trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
         output.update(trajectory)
@@ -409,7 +409,7 @@ class TrajectoryHead(nn.Module):
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
             requires_grad=False,
-        ) # 20,8,2，这个就是聚类的traj,每个mode一个聚类中心
+        ) # 20,8,2
         self.plan_anchor_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),
@@ -455,15 +455,13 @@ class TrajectoryHead(nn.Module):
         else:
             return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img)
 
-    # 要改的话首先改这个Model即可，别的都不用动
 
-    
     def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
-        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1) #这个居然没有读取文件？？
-        odo_info_fut = self.norm_odo(plan_anchor) # 4,20,8,2,8是timestamps
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
+        odo_info_fut = self.norm_odo(plan_anchor)
         timesteps = torch.randint(
             0, 50,
             (bs,), device=device

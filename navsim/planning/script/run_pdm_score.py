@@ -50,6 +50,9 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
     assert (
         simulator.proposal_sampling == scorer.proposal_sampling
     ), "Simulator and scorer proposal sampling has to be identical"
+    # if agent.checkpoint_path is None:
+    #     logger.warning("Agent checkpoint path is None")
+    #     agent.checkpoint_path = '/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/ckpt/DiffussionDrive/diffusiondrive_navsim_88p1_PDMS.pth' 
     agent: AbstractAgent = instantiate(cfg.agent)
     agent.initialize()
 

@@ -15,10 +15,11 @@ defaults:
   - _self_
 
 split: trainval
-cache_path: ${oc.env:NAVSIM_EXP_ROOT}/training_cache
+cache_path: ${oc.env:NAVSIM_EXP_ROOT}/training_cache # 在这里指定缓存路径
 use_cache_without_dataset: false # load the training samples from the cache. scene-filter will be ignored
 force_cache_computation: true
 seed: 0
+use_test_for_training: false
 
 dataloader:
   params:
@@ -40,6 +41,8 @@ trainer:
     strategy: ddp
     precision: 16-mixed  # floating point precision
     num_nodes: 1  # Number of nodes used for training
+
+    devices: auto  # Number of devices (GPUs) used for training. Set to 'auto' to use all available devices.
 
     num_sanity_val_steps: 0  # number of validation steps to run before training begins
     fast_dev_run: false  # runs 1 batch of train/val/test for sanity

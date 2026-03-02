@@ -96,7 +96,7 @@ def main(cfg: DictConfig) -> None:
     lightning_module = AgentLightningModule(
         agent=agent,
     )
-
+    # 把这里改为test_logs即可运行
     if cfg.use_cache_without_dataset:
         logger.info("Using cached data without building SceneLoader")
         assert (
@@ -105,18 +105,33 @@ def main(cfg: DictConfig) -> None:
         assert (
             cfg.cache_path is not None
         ), "cache_path must be provided when using cached data without building SceneLoader"
-        train_data = CacheOnlyDataset(
-            cache_path=cfg.cache_path,
-            feature_builders=agent.get_feature_builders(),
-            target_builders=agent.get_target_builders(),
-            log_names=cfg.train_logs,
-        )
-        val_data = CacheOnlyDataset(
-            cache_path=cfg.cache_path,
-            feature_builders=agent.get_feature_builders(),
-            target_builders=agent.get_target_builders(),
-            log_names=cfg.val_logs,
-        )
+        if cfg.use_test_for_training:
+            logger.warning("Using test logs for training. This is not recommended for actual training runs.")
+            train_data = CacheOnlyDataset(
+                cache_path=cfg.cache_path,
+                feature_builders=agent.get_feature_builders(), #这个和数据pipeline比较像
+                target_builders=agent.get_target_builders(),
+                log_names=cfg.test_logs,
+            )
+            val_data = CacheOnlyDataset(
+                cache_path=cfg.cache_path,
+                feature_builders=agent.get_feature_builders(),
+                target_builders=agent.get_target_builders(),
+                log_names=cfg.test_logs,
+            )
+        else:
+            train_data = CacheOnlyDataset(
+                cache_path=cfg.cache_path,
+                feature_builders=agent.get_feature_builders(),
+                target_builders=agent.get_target_builders(),
+                log_names=cfg.train_logs,
+            )
+            val_data = CacheOnlyDataset(
+                cache_path=cfg.cache_path,
+                feature_builders=agent.get_feature_builders(),
+                target_builders=agent.get_target_builders(),
+                log_names=cfg.val_logs,
+            )
     else:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)

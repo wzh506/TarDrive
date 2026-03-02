@@ -1,0 +1,65 @@
+
+
+
+
+1.首先生成cache
+# cache dataset for training
+python navsim/planning/script/run_dataset_caching.py agent=diffusiondrive_agent experiment_name=training_diffusiondrive_agent train_test_split=navtrain
+
+# cache dataset for testing
+python navsim/planning/script/run_dataset_caching.py agent=diffusiondrive_agent experiment_name=training_diffusiondrive_agent train_test_split=navtest
+
+
+# cache dataset for evaluation
+python navsim/planning/script/run_metric_caching.py train_test_split=navtest cache.cache_path=$NAVSIM_EXP_ROOT/metric_cache
+
+
+python navsim/planning/script/run_metric_caching.py train_test_split=navhard_two_stage cache.cache_path=$NAVSIM_EXP_ROOT/metric_cache
+
+
+2.然后进行模型训练
+
+config文件位于/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/navsim/planning/script/config
+同时也是/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_config.py
+
+# 在trainval上进行训练
+python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
+        agent=diffusiondrive_agent \
+        experiment_name=training_diffusiondrive_agent  \
+        train_test_split=navtrain  \
+        split=trainval   \
+        trainer.params.max_epochs=100 \
+        cache_path="${NAVSIM_EXP_ROOT}/training_cache/" \
+        
+        use_cache_without_dataset=True  \
+        force_cache_computation=False 
+
+# 在test上进行训练，我自己增加了一个参数，主要是用于在testing上进行训练使用的
+python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
+        agent=diffusiondrive_agent \
+        experiment_name=training_diffusiondrive_agent  \
+        train_test_split=navtest  \
+        split=test   \
+        trainer.params.max_epochs=100 \
+        cache_path="${NAVSIM_EXP_ROOT}/testing_cache/" \
+        use_cache_without_dataset=True  \
+        use_test_for_training=True \
+        force_cache_computation=False 
+
+
+3.最后进行模型测试
+
+
+python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
+        train_test_split=navtest \
+        agent=diffusiondrive_agent \
+        worker=ray_distributed \
+        agent.checkpoint_path=/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/ckpt/DiffussionDrive/diffusiondrive_navsim_88p1_PDMS.pth \
+        experiment_name=diffusiondrive_agent_eval
+
+
+2.模型配置文件位于：/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/navsim/planning/script/config
+主要训练配置文件位于：/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/navsim/planning/script/config/training
+模型结构文件位于：/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/navsim/agents/tardrive
+
+3.训练时调用的显卡数量在default_trainging.yaml中没有强调，默认应该是所有显卡
