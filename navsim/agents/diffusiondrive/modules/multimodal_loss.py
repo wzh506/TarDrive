@@ -130,7 +130,7 @@ class LossComputer(nn.Module):
         """
         bs, num_mode, ts, d = poses_reg.shape
         target_traj = targets["trajectory"]
-        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
+        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1) #选一个最近得模式，然后给他高分
         dist = dist.mean(dim=-1)
         mode_idx = torch.argmin(dist, dim=-1)
         cls_target = mode_idx

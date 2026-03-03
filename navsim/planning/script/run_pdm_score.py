@@ -81,7 +81,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
 
             agent_input = scene_loader.get_agent_input_from_token(token)
             if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
+                scene = scene_loader.get_scene_from_token(token) #DiffusionDrive没走这条线，不然报错了（需要高精度地图）
                 trajectory = agent.compute_trajectory(agent_input, scene)
             else:
                 trajectory = agent.compute_trajectory(agent_input)

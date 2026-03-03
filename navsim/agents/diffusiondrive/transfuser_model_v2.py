@@ -463,17 +463,17 @@ class TrajectoryHead(nn.Module):
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1) #这个居然没有读取文件？？
-        odo_info_fut = self.norm_odo(plan_anchor) # 4,20,8,2,8是timestamps
+        odo_info_fut = self.norm_odo(plan_anchor) # 4,20,8,2,8是timestamps,放缩到[-1,1]
         timesteps = torch.randint(
             0, 50,
             (bs,), device=device
-        )
+        ) #采样时间步，这个和上面那个8没有关系，8是聚类中心的数量，这个是diffusion的时间步
         noise = torch.randn(odo_info_fut.shape, device=device)
         noisy_traj_points = self.diffusion_scheduler.add_noise(
             original_samples=odo_info_fut,
             noise=noise,
             timesteps=timesteps,
-        ).float()
+        ).float() # 本来应该在GT上加噪，但是这里选择在Anchor上加噪
         noisy_traj_points = torch.clamp(noisy_traj_points, min=-1, max=1)
         noisy_traj_points = self.denorm_odo(noisy_traj_points)
 

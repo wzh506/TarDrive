@@ -7,9 +7,9 @@ from PIL import ImageColor
 import matplotlib.pyplot as plt
 from pyquaternion import Quaternion
 
-from navsim.common.dataclasses import Camera, Lidar, Annotations
+from navsim.common.dataclasses import Camera, Lidar, Annotations, Trajectory
 from navsim.common.enums import LidarIndex, BoundingBoxIndex
-from navsim.visualization.config import AGENT_CONFIG
+from navsim.visualization.config import AGENT_CONFIG, TRAJECTORY_CONFIG
 from navsim.visualization.lidar import filter_lidar_pc, get_lidar_pc_color
 from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
 
@@ -21,7 +21,157 @@ def add_camera_ax(ax: plt.Axes, camera: Camera) -> plt.Axes:
     :param camera: navsim camera dataclass
     :return: ax object with image
     """
+    if camera.image is None: #加一个保护策略
+        return ax
     ax.imshow(camera.image)
+    return ax
+
+
+def add_trajectory_to_camera_ax(
+    ax: plt.Axes,
+    camera: Camera,
+    trajectory: Trajectory,
+    which: str = "agent",
+) -> plt.Axes:
+    """Overlay a ground-plane trajectory onto a camera image.
+
+    Assumes the trajectory is expressed in the ego / lidar frame at z=0.
+    """
+
+    if camera.image is None:
+        return ax
+
+    if (
+        camera.sensor2lidar_rotation is None
+        or camera.sensor2lidar_translation is None
+        or camera.intrinsics is None
+    ):
+        # Missing calibration for this camera; just draw the raw image.
+        ax.imshow(camera.image)
+        return ax
+
+    image = camera.image.copy() #每次都是新copy，所以都是新图！
+    img_h, img_w = image.shape[:2]
+
+    # Build 3D points on ground plane in ego/lidar frame: (x, y, 0).
+    # Scene.get_future_trajectory() / agent.compute_trajectory() return poses
+    # *excluding* the current ego position. To mimic BEV plotting behavior
+    # (which prepends [0, 0]), we explicitly add the origin so the line
+    # connects back to the vehicle center in the image.
+
+    # 之前：只用未来点
+    poses_xy = trajectory.poses[:, :2]
+    z = np.zeros((poses_xy.shape[0], 1), dtype=np.float32)
+    points_lidar = np.concatenate([poses_xy.astype(np.float32), z], axis=1)
+
+    # 现在：先加上原点，再拼未来点
+    # poses_xy = trajectory.poses[:, :2].astype(np.float32)
+    # origin_xy = np.zeros((1, 2), dtype=np.float32)
+    # poses_xy = np.concatenate([origin_xy, poses_xy], axis=0)
+    # z = np.zeros((poses_xy.shape[0], 1), dtype=np.float32)
+    # points_lidar = np.concatenate([poses_xy, z], axis=1)
+
+    # Reuse the lidar->camera projection logic from _transform_pcs_to_images.
+    sensor2lidar_rotation = camera.sensor2lidar_rotation
+    sensor2lidar_translation = camera.sensor2lidar_translation
+
+    lidar2cam_r = np.linalg.inv(sensor2lidar_rotation)
+    lidar2cam_t = sensor2lidar_translation @ lidar2cam_r.T
+    lidar2cam_rt = np.eye(4, dtype=np.float32)
+    lidar2cam_rt[:3, :3] = lidar2cam_r.T
+    lidar2cam_rt[3, :3] = -lidar2cam_t
+
+    viewpad = np.eye(4, dtype=np.float32)
+    intrinsic = camera.intrinsics
+    viewpad[: intrinsic.shape[0], : intrinsic.shape[1]] = intrinsic
+    lidar2img_rt = viewpad @ lidar2cam_rt.T
+
+    cur_pts = np.concatenate([points_lidar, np.ones_like(points_lidar)[:, :1]], axis=1)
+    cur_pts_cam = (lidar2img_rt @ cur_pts.T).T
+
+    # eps = 1e-3
+    # in_front = cur_pts_cam[:, 2] > eps
+    # cur_pts_cam = cur_pts_cam[..., 0:2] / np.maximum(
+    #     cur_pts_cam[..., 2:3], np.ones_like(cur_pts_cam[..., 2:3]) * eps
+    # )
+
+    # # Filter to image bounds.
+    # x, y = cur_pts_cam[:, 0], cur_pts_cam[:, 1]
+    # in_img = (
+    #     in_front
+    #     & (x > 0)
+    #     & (x < img_w - 1)
+    #     & (y > 0)
+    #     & (y < img_h - 1)
+    # )
+
+    # pts_img = np.stack([x[in_img], y[in_img]], axis=1).astype(np.int32)
+    # if len(pts_img) < 2:
+    #     ax.imshow(image)
+    #     return ax
+
+    # cfg = TRAJECTORY_CONFIG.get(which, TRAJECTORY_CONFIG["agent"])
+    # color = ImageColor.getcolor(cfg["line_color"], "RGB")
+
+    # # Draw as a polyline.
+    # for i in range(len(pts_img) - 1):
+    #     cv2.line(
+    #         image,
+    #         (pts_img[i, 0], pts_img[i, 1]),
+    #         (pts_img[i + 1, 0], pts_img[i + 1, 1]),
+    #         color,
+    #         int(cfg["line_width"]),
+    #         cv2.LINE_AA,
+    #     )
+
+
+    eps = 1e-3
+    depths = cur_pts_cam[:, 2]
+    in_front = depths > eps
+    cur_pts_cam = cur_pts_cam[..., 0:2] / np.maximum(
+        depths[:, None], np.ones_like(depths[:, None]) * eps
+    )
+
+    x, y = cur_pts_cam[:, 0], cur_pts_cam[:, 1]
+
+    cfg = TRAJECTORY_CONFIG.get(which, TRAJECTORY_CONFIG["agent"])
+    color = ImageColor.getcolor(cfg["line_color"], "RGB")
+
+    # For each consecutive pair, use cv2.clipLine to keep the in-image
+    # portion of the segment even if one or both endpoints lie outside
+    # the image bounds.
+    roi = (0, 0, img_w - 1, img_h - 1)
+    num_pts = len(x)
+    if num_pts < 2:
+        return image
+
+    for i in range(num_pts - 1):
+        # Skip if both points are behind the camera.
+        if not (in_front[i] or in_front[i + 1]):
+            continue
+
+        p1 = (float(x[i]), float(y[i]))
+        p2 = (float(x[i + 1]), float(y[i + 1]))
+
+        ok, clipped_p1, clipped_p2 = cv2.clipLine(
+            roi,
+            (int(round(p1[0])), int(round(p1[1]))),
+            (int(round(p2[0])), int(round(p2[1]))),
+        )
+        if not ok:
+            continue
+
+        cv2.line(
+            image,
+            clipped_p1,
+            clipped_p2,
+            color,
+            int(cfg["line_width"]),
+            cv2.LINE_AA,
+        )
+
+        
+    ax.imshow(image)
     return ax
 
 

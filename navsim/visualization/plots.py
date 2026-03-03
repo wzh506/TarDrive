@@ -9,7 +9,12 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Scene
 from navsim.visualization.config import BEV_PLOT_CONFIG, TRAJECTORY_CONFIG, CAMERAS_PLOT_CONFIG
 from navsim.visualization.bev import add_configured_bev_on_ax, add_trajectory_to_bev_ax
-from navsim.visualization.camera import add_annotations_to_camera_ax, add_lidar_to_camera_ax, add_camera_ax
+from navsim.visualization.camera import (
+    add_annotations_to_camera_ax,
+    add_lidar_to_camera_ax,
+    add_camera_ax,
+    add_trajectory_to_camera_ax,
+)
 
 
 def configure_bev_ax(ax: plt.Axes) -> plt.Axes:
@@ -89,6 +94,41 @@ def plot_bev_with_agent(scene: Scene, agent: AbstractAgent) -> Tuple[plt.Figure,
     add_trajectory_to_bev_ax(ax, agent_trajectory, TRAJECTORY_CONFIG["agent"])
     configure_bev_ax(ax)
     configure_ax(ax)
+
+    return fig, ax
+
+
+def plot_camera_with_trajectories(
+    scene: Scene,
+    agent: AbstractAgent,
+    camera_name: str = "cam_f0",
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Plot a single camera view with human and agent trajectories overlaid.
+
+    :param scene: navsim scene dataclass
+    :param agent: navsim agent used to compute the predicted trajectory
+    :param camera_name: attribute name of the camera in frame.cameras (e.g. "cam_f0")
+    :return: figure and ax object of matplotlib
+    """
+
+    agent_trajectory = agent.compute_trajectory(scene.get_agent_input())
+    human_trajectory = scene.get_future_trajectory(len(agent_trajectory.poses)) #根据agent的预测来调节
+
+    frame_idx = scene.scene_metadata.num_history_frames - 1
+    frame = scene.frames[frame_idx]
+
+    camera = getattr(frame.cameras, camera_name)
+
+    fig, ax = plt.subplots(1, 1, figsize=CAMERAS_PLOT_CONFIG["figure_size"])
+
+    # base image
+    add_camera_ax(ax, camera)
+    # overlay GT (human) and agent trajectories #这里有bug,human画不出来（每次都是重新在camera上画图）
+    add_trajectory_to_camera_ax(ax, camera, human_trajectory, which="human")
+    add_trajectory_to_camera_ax(ax, camera, agent_trajectory, which="agent")
+    # fig.savefig('/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/do.png', dpi=200, bbox_inches="tight")
+    configure_ax(ax)
+    fig.tight_layout()
 
     return fig, ax
 
