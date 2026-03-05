@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+# from navsim.agents.tardrive.transfuser_config import TransfuserConfig
 
 def main(output_path: str | None = None) -> None:
     """Load plan_anchor (kmeans_navsim_traj_20.npy) and plot as 2D trajectories

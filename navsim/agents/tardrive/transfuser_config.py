@@ -15,9 +15,12 @@ class TransfuserConfig:
 
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
-    bkb_path: str = "/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/ckpt/resnet/pytorch_model.bin"
+    # bkb_path: str = "/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/ckpt/resnet/pytorch_model.bin"
+    bkb_path: str = None
     plan_anchor_path: str = "/workspace/wangch8@xiaopeng.com/github/DiffusionDrive/ckpt/resnet/kmeans_navsim_traj_20.npy"
+    ego_fut_mode: int = 20
 
+    
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
 
@@ -75,14 +78,25 @@ class TransfuserConfig:
     tf_num_head: int = 8
     tf_dropout: float = 0.0
 
+
+
+    # Normalizing Flow
+    nf_channels: int = 2
+    nf_d_model: int = 256
+    nf_num_blocks: int = 4
+    nf_num_layers: int = 2
+    noise_std: float = 0.05
+    use_mean_det: bool = False
+
     # detection
     num_bounding_boxes: int = 30
 
     # loss weights
     trajectory_weight: float = 12.0
     trajectory_cls_weight: float = 10.0
-    trajectory_reg_weight: float = 8.0
-    diff_loss_weight: float = 20.0
+    trajectory_reg_weight: float = 0.0 #这个是TarDrive的特点，监督不了，但是别的可以
+    diff_loss_weight: float = 0.0 #没用Diffusion
+    flow_loss_weight: float = 20.0
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

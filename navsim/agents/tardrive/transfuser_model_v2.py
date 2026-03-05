@@ -12,6 +12,7 @@ from navsim.agents.tardrive.modules.conditional_unet1d import ConditionalUnet1D,
 import torch.nn.functional as F
 from navsim.agents.tardrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.tardrive.modules.multimodal_loss import LossComputer
+from navsim.agents.tardrive.modules.sequence_flow import SequenceFlowModel
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -80,13 +81,14 @@ class V2TransfuserModel(nn.Module):
             d_model=config.tf_d_model,
         )
 
-        self._trajectory_head = TrajectoryHead(
+        self._trajectory_head = TrajectoryFlowHead(
             num_poses=config.trajectory_sampling.num_poses,
             d_ffn=config.tf_d_ffn,
             d_model=config.tf_d_model,
             plan_anchor_path=config.plan_anchor_path,
             config=config,
         )
+        
         self.bev_proj = nn.Sequential(
             *linear_relu_ln(256, 1, 1,320),
         )
@@ -556,3 +558,288 @@ class TrajectoryHead(nn.Module):
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         return {"trajectory": best_reg}
+
+
+class TrajectoryFlowHead(nn.Module):
+    """
+    基于 TarFlow 思路的 1D 轨迹 Flow Head：
+    - 把多模 plan_anchor 视为序列 (B, T, C)，T = ego_fut_mode * num_poses, C = 3
+    - 使用带因果 mask 的 Transformer 对序列做自回归仿射变换
+    - 训练时最小化 z^2 与 logdet（normalizing flow 风格）
+    - 推理时从先验采样，经过逆变换得到轨迹，再 reshape 回 (B, M, num_poses, 3)
+    """
+
+    def __init__(
+        self,
+        num_poses: int,
+        d_ffn: int,
+        d_model: int,
+        plan_anchor_path: str,
+        config: TransfuserConfig,
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        nhead: int = 8,
+    ):
+        super().__init__()
+
+        self._num_poses = num_poses          # 例如 8
+        self._d_model = d_model
+        self._d_ffn = d_ffn
+        self.ego_fut_mode = config.ego_fut_mode             # 模式数，和原来保持一致
+        self.noise_std = config.noise_std
+        self.use_mean_det = config.use_mean_det
+
+        # 加载 plan anchors: (M, T, 2) 这里只包含 (x, y) 聚类中心
+        plan_anchor_xy = np.load(plan_anchor_path)  # [M, num_poses, 2]
+        assert plan_anchor_xy.ndim == 3
+        M, P, D = plan_anchor_xy.shape
+        assert D == 2
+        assert P == num_poses
+
+        self.plan_anchor = nn.Parameter(
+            torch.tensor(plan_anchor_xy, dtype=torch.float32),
+            requires_grad=False,
+        )  # (M, P, 2)
+
+        # 条件 embedding：把 ego_query / status_encoding / agents_query 压到一个全局 cond 向量上
+        cond_in_dim = d_model * 3  # ego + status + pooled agents
+
+
+        self.loss_computer = LossComputer(config)
+
+        # 使用 3 维 flow: [offset_x, offset_y, heading]
+        self.flow = SequenceFlowModel(
+            in_channels=3,                                 # 3 维 (x, y, heading)
+            seq_len=config.trajectory_sampling.num_poses,  # P
+            channels=config.nf_d_model,
+            num_blocks=config.nf_num_blocks,
+            layers_per_block=config.nf_num_layers,
+            nvp=True,
+            num_classes=0,
+            use_mean_det=config.use_mean_det,
+        ) #这东西有一个学习参数，要记住使用
+
+        self.plan_anchor_encoder = nn.Sequential(
+            *linear_relu_ln(d_model, 1, 1,512),
+            nn.Linear(d_model, d_model),
+        )
+
+    def norm_odo(self, odo_info_fut):
+        odo_info_fut_x = odo_info_fut[..., 0:1]
+        odo_info_fut_y = odo_info_fut[..., 1:2]
+        odo_info_fut_head = odo_info_fut[..., 2:3]
+
+        odo_info_fut_x = 2*(odo_info_fut_x + 1.2)/56.9 -1
+        odo_info_fut_y = 2*(odo_info_fut_y + 20)/46 -1
+        odo_info_fut_head = 2*(odo_info_fut_head + 2)/3.9 -1
+        return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
+    def denorm_odo(self, odo_info_fut):
+        odo_info_fut_x = odo_info_fut[..., 0:1]
+        odo_info_fut_y = odo_info_fut[..., 1:2]
+        odo_info_fut_head = odo_info_fut[..., 2:3]
+
+        odo_info_fut_x = (odo_info_fut_x + 1)/2 * 56.9 - 1.2
+        odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
+        odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
+        return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
+    
+    def _select_best_mode(self, plan_anchor_b: torch.Tensor, target_traj: torch.Tensor) -> torch.Tensor:
+        """与 LossComputer 相同的最近 anchor 模式选择逻辑.
+
+        Args:
+            plan_anchor_b: (B, M, P, 2)
+            target_traj:   (B, P, 3)
+        Returns:
+            mode_idx:      (B,) 每个样本的最近 mode 下标
+        """
+        # dist: (B, M)
+        dist = torch.linalg.norm(
+            target_traj.unsqueeze(1)[..., :2] - plan_anchor_b,
+            dim=-1,
+        )
+        dist = dist.mean(dim=-1)
+        mode_idx = torch.argmin(dist, dim=-1)  # (B,)
+        return mode_idx
+
+    def _make_causal_mask(self, T, device):
+        # 下三角为 0，上三角为 -inf，给 TransformerEncoderLayer 用作 attn_mask
+        mask = torch.full((T, T), float('-inf'), device=device)
+        mask = torch.triu(mask, diagonal=1)
+        return mask
+
+
+    def forward_train(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        targets=None,
+        global_img=None,
+    ) -> Dict[str, torch.Tensor]:
+        B = ego_query.size(0)
+        device = ego_query.device
+        # plan_anchor: (M, P, 2) -> (B, M, P, 2)
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(B, 1, 1, 1).to(device)
+
+        # GT 轨迹 (x, y, heading): (B, P, 3)
+        gt_traj = targets["trajectory"].to(device)
+
+        # offset = gt_xy - anchor_xy，heading 直接用 GT
+        gt_xy = gt_traj[..., :2]                              # (B, P, 2)
+        gt_head = gt_traj[..., StateSE2Index.HEADING:StateSE2Index.HEADING+1]  # (B, P, 1)
+
+        offset_xy = gt_xy.unsqueeze(1) - plan_anchor          # (B, M, P, 2)
+        head_rep = gt_head.unsqueeze(1).expand(B, self.ego_fut_mode, self._num_poses, 1)
+
+        odo_info_fut = torch.cat([offset_xy, head_rep], dim=-1)  # (B, M, P, 3)
+        odo_info_fut = self.norm_odo(odo_info_fut)               # 归一化到 [-1, 1]
+
+        # 加一点噪声做数据增强
+        noise = self.noise_std * torch.randn_like(odo_info_fut)
+        noisy_odo = torch.clamp(odo_info_fut + noise, min=-1, max=1)
+
+        # 还原到物理尺度，作为 flow 的输入
+        noisy_traj_points = self.denorm_odo(noisy_odo)          # (B, M, P, 3)
+
+        ego_fut_mode = noisy_traj_points.shape[1]
+        # 2. proj noisy_traj_points to the query，老实了，我计划改为anchor的值 T_T
+        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+        traj_pos_embed = traj_pos_embed.flatten(-2)
+        traj_pos_embed = traj_pos_embed.to(self.plan_anchor_encoder[0].weight.dtype)
+
+        traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+        traj_feature = traj_feature.view(B, ego_fut_mode, -1)   # (B, M, D_model)
+
+        # 3) TarFlow 风格 flow：x -> z，计算 NLL，同时得到每个 block 的候选轨迹和 mode logits
+        # best_mode: (B,) 选出与 GT 最接近的 anchor 模式
+        best_mode = self._select_best_mode(plan_anchor, gt_traj)
+        z, poses_reg_list, logdets, poses_cls_list = self.flow(
+            traj_feature,
+            noisy_traj_points,
+            ego_query,
+            agents_query,
+            bev_feature,
+            bev_spatial_shape,
+            status_encoding,
+            global_img,
+            best_mode
+        )  # z: (B, M, T, 3), logdets: (B,M),现在来挑
+
+        # 简化版 NLL：0.5 * ||z||^2 - logdet
+        if self.use_mean_det:
+            # 直接对所有 M 个 mode 取均值，等价于忽略 best_mode
+            # z: (B, M, T, 3), logdets: (B, M)
+            nll = 0.5 * (z ** 2).mean(dim=[1, 2, 3]) - logdets.mean(dim=1)  # (B,)
+            flow_loss = nll.mean()
+        else:
+            # 只优化对应 best_mode 的那一条轨迹
+            # 先按 batch 选出每个样本最优模式的 z 和 logdet
+            batch_idx = torch.arange(B, device=z.device)
+            z_best = z[batch_idx, best_mode]           # (B, T, 3)
+            logdet_best = logdets[batch_idx, best_mode]  # (B,)
+
+            nll = 0.5 * (z_best ** 2).sum(dim=[1, 2]) - logdet_best  # (B,)
+            flow_loss = nll.mean()
+
+        # 这里暂时只用 flow_loss 作为 trajectory_loss，
+        # 多模监督可以后续基于 poses_reg_list / poses_cls_list 接上 LossComputerToDo
+        # trajectory_loss_dict = {"flow_loss": flow_loss}
+        trajectory_loss_dict = {}
+        ret_traj_loss = 0
+        # 下面这个要修改一下置信度的分数
+        for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
+            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
+            trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
+            ret_traj_loss += trajectory_loss
+        
+        trajectory_loss_dict[f"flow_loss"] = flow_loss
+        best_reg = gt_traj
+        return {"trajectory": best_reg, "flow_loss": flow_loss, "trajectory_loss": ret_traj_loss, "trajectory_loss_dict": trajectory_loss_dict}
+        # 功能：trajectory输出是真值GT，trajectory_loss现在只包含cls,trajectory_loss_dict中包含重要的flow_loss
+
+    def forward_test(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img=None,
+    ) -> Dict[str, torch.Tensor]:
+        # B = ego_query.size(0)
+        # device = ego_query.device
+
+        # plan_anchor = self.plan_anchor.unsqueeze(0).repeat(B, 1, 1, 1).to(device)  # (B, M, P, 3)
+        # plan_anchor_seq = plan_anchor.reshape(B, self.seq_len, 3)                 # (B, T, 3)
+
+        # cond = self._build_cond(ego_query, agents_query, status_encoding)         # (B, H)
+
+        # # 先从标准正态采样 z
+        # z = torch.randn(B, self.seq_len, 3, device=device)
+
+        # # 逆变换到 offset 空间
+        # offset_seq = self._flow_inverse(z, cond)                                  # (B, T, 3)
+        # offset = offset_seq.view(B, self.ego_fut_mode, self._num_poses, 3)        # (B, M, P, 3)
+
+        # traj_candidates = plan_anchor + offset                                    # (B, M, P, 3)
+
+        # # 简单用 traj_feature 做一个打分选 mode（也可以复用 _traj_head 做分类）
+        # tok = self.token_proj(offset_seq)
+        # pos = self.pos_embed[None, :, :].expand(B, self.seq_len, -1)
+        # cond_expand = cond[:, None, :].expand(B, self.seq_len, -1)
+        # cond_expand = nn.functional.pad(cond_expand, (0, tok.size(-1) - cond_expand.size(-1)))
+        # h = tok + pos + cond_expand
+        # causal_mask = self._make_causal_mask(self.seq_len, device)
+        # h_enc = self.encoder(h, mask=causal_mask)
+        # traj_feature = h_enc.view(B, self.ego_fut_mode, self._num_poses, -1).mean(dim=2)
+
+        # _, poses_cls = self._traj_head(traj_feature)                              # (B, M)
+        # mode_idx = poses_cls.argmax(dim=-1)                                       # (B,)
+        # mode_idx = mode_idx[:, None, None, None].repeat(1, 1, self._num_poses, 3)
+        # best_reg = torch.gather(traj_candidates, 1, mode_idx).squeeze(1)         # (B, P, 3)
+
+        # return {"trajectory": best_reg}
+
+        B = ego_query.size(0)
+        device = ego_query.device
+        # plan_anchor: (M, P, 2) -> (B, M, P, 2)
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(B, 1, 1, 1).to(device)
+
+        fixed_noise = torch.randn(B, self._num_poses, 3, device=device)
+        fixed_noise = fixed_noise * self.var.sqrt()
+
+        noisy_traj_points = self.denorm_odo(noisy_traj_points)
+
+        ego_fut_mode = noisy_traj_points.shape[1]
+        # 2. proj noisy_traj_points to the query
+        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
+        traj_pos_embed = traj_pos_embed.flatten(-2)
+        traj_pos_embed = traj_pos_embed.to(self.plan_anchor_encoder[0].weight.dtype)
+
+        traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+        traj_feature = traj_feature.view(B,ego_fut_mode,-1)
+
+
+        # 4. begin the stacked decoder
+        poses_reg_list, _, poses_cls_list = self.flow.reverse(traj_feature, fixed_noise, bev_feature, bev_spatial_shape, agents_query, ego_query,  status_encoding,global_img)
+        poses_reg = poses_reg_list[-1] + plan_anchor.unsqueeze(0) #别忘了原来算的是残差, 这里要加回来
+        poses_cls = poses_cls_list[-1]
+        # 直接选择最高的输出哈
+        mode_idx = poses_cls.argmax(dim=-1)
+        mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
+        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
+        return {"trajectory": best_reg}
+        
+    
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+        """Torch module forward pass."""
+        if self.training:
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img)
+        else:
+            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img)
+        
+
+
+
