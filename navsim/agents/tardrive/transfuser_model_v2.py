@@ -586,8 +586,11 @@ class TrajectoryFlowHead(nn.Module):
         self._d_model = d_model
         self._d_ffn = d_ffn
         self.ego_fut_mode = config.ego_fut_mode             # 模式数，和原来保持一致
-        self.noise_std = config.noise_std
+        self.noise_std_x = config.noise_std_x
+        self.noise_std_y = config.noise_std_y
+        self.noise_std_head = config.noise_std_head
         self.use_mean_det = config.use_mean_det
+        self.use_residual = config.use_residual
 
         # 加载 plan anchors: (M, T, 2) 这里只包含 (x, y) 聚类中心
         plan_anchor_xy = np.load(plan_anchor_path)  # [M, num_poses, 2]
@@ -689,15 +692,21 @@ class TrajectoryFlowHead(nn.Module):
         # offset = gt_xy - anchor_xy，heading 直接用 GT
         gt_xy = gt_traj[..., :2]                              # (B, P, 2)
         gt_head = gt_traj[..., StateSE2Index.HEADING:StateSE2Index.HEADING+1]  # (B, P, 1)
-
-        offset_xy = gt_xy.unsqueeze(1) - plan_anchor          # (B, M, P, 2)
+        if self.use_residual:
+            offset_xy = gt_xy.unsqueeze(1).expand(B, self.ego_fut_mode, self._num_poses, 2) - plan_anchor          # (B, M, P, 2)
+        else:
+            offset_xy = gt_xy.unsqueeze(1).expand(B, self.ego_fut_mode, self._num_poses, 2)         # (B, M, P, 2)
         head_rep = gt_head.unsqueeze(1).expand(B, self.ego_fut_mode, self._num_poses, 1)
 
         odo_info_fut = torch.cat([offset_xy, head_rep], dim=-1)  # (B, M, P, 3)
         odo_info_fut = self.norm_odo(odo_info_fut)               # 归一化到 [-1, 1]
 
         # 加一点噪声做数据增强
-        noise = self.noise_std * torch.randn_like(odo_info_fut)
+        noise_x = self.noise_std_x * torch.randn_like(odo_info_fut[..., 0:1])
+        noise_y = self.noise_std_y * torch.randn_like(odo_info_fut[..., 1:2])
+        noise_head = self.noise_std_head * torch.randn_like(odo_info_fut[..., 2:3])
+        noise = torch.cat([noise_x, noise_y, noise_head], dim=-1)
+        
         noisy_odo = torch.clamp(odo_info_fut + noise, min=-1, max=1)
 
         # 还原到物理尺度，作为 flow 的输入
@@ -705,7 +714,9 @@ class TrajectoryFlowHead(nn.Module):
 
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query，老实了，我计划改为anchor的值 T_T
-        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+        # 这里改为从anchor的获得，和diffusiondrive同理
+
+        traj_pos_embed = gen_sineembed_for_position(plan_anchor, hidden_dim=64)
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_pos_embed = traj_pos_embed.to(self.plan_anchor_encoder[0].weight.dtype)
 
@@ -731,18 +742,19 @@ class TrajectoryFlowHead(nn.Module):
         if self.use_mean_det:
             # 直接对所有 M 个 mode 取均值，等价于忽略 best_mode
             # z: (B, M, T, 3), logdets: (B, M)
-            nll = 0.5 * (z ** 2).mean(dim=[1, 2, 3]) - logdets.mean(dim=1)  # (B,)
+            nll = 0.5 * z.pow(2).mean() - logdets.mean()  # (B,)
             flow_loss = nll.mean()
         else:
             # 只优化对应 best_mode 的那一条轨迹
             # 先按 batch 选出每个样本最优模式的 z 和 logdet
             batch_idx = torch.arange(B, device=z.device)
-            z_best = z[batch_idx, best_mode]           # (B, T, 3)
+            z_best = z[batch_idx, best_mode]             # (B, T, 3)
             logdet_best = logdets[batch_idx, best_mode]  # (B,)
 
-            nll = 0.5 * (z_best ** 2).sum(dim=[1, 2]) - logdet_best  # (B,)
-            flow_loss = nll.mean()
-
+            # 注意：TarDriveMetaBlock 中 logdet 是在 (T, C_in) 上做 mean，
+            # 这里为了与 use_mean_det 分支保持一致，也在 z 上用 mean。
+            flow_loss = 0.5 * z_best.pow(2).mean() - logdet_best.mean()  # (B,)
+            # z的值太大了，查询原因去
         # 这里暂时只用 flow_loss 作为 trajectory_loss，
         # 多模监督可以后续基于 poses_reg_list / poses_cls_list 接上 LossComputerToDo
         # trajectory_loss_dict = {"flow_loss": flow_loss}
@@ -808,23 +820,25 @@ class TrajectoryFlowHead(nn.Module):
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(B, 1, 1, 1).to(device)
 
         fixed_noise = torch.randn(B, self._num_poses, 3, device=device)
-        fixed_noise = fixed_noise * self.var.sqrt()
+        fixed_noise = fixed_noise * self.flow.var.sqrt()
 
-        noisy_traj_points = self.denorm_odo(noisy_traj_points)
+        noisy_traj_points = self.denorm_odo(fixed_noise)
 
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query
-        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
+        traj_pos_embed = gen_sineembed_for_position(plan_anchor,hidden_dim=64)
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_pos_embed = traj_pos_embed.to(self.plan_anchor_encoder[0].weight.dtype)
 
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
         traj_feature = traj_feature.view(B,ego_fut_mode,-1)
 
-
         # 4. begin the stacked decoder
-        poses_reg_list, _, poses_cls_list = self.flow.reverse(traj_feature, fixed_noise, bev_feature, bev_spatial_shape, agents_query, ego_query,  status_encoding,global_img)
-        poses_reg = poses_reg_list[-1] + plan_anchor.unsqueeze(0) #别忘了原来算的是残差, 这里要加回来
+        poses_reg_list, _, poses_cls_list = self.flow.reverse(traj_feature, fixed_noise,ego_query,agents_query, bev_feature, bev_spatial_shape, status_encoding,global_img)
+        if self.use_residual:
+            poses_reg = poses_reg_list[-1] + plan_anchor.unsqueeze(0) #别忘了原来算的是残差, 这里要加回来,而且要补0
+        else:
+            poses_reg = poses_reg_list[-1]
         poses_cls = poses_cls_list[-1]
         # 直接选择最高的输出哈
         mode_idx = poses_cls.argmax(dim=-1)

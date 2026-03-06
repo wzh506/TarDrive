@@ -269,6 +269,24 @@ class SequenceFlowModel(nn.Module):
             logdets: summed log-determinant per sample (B,).
         """
         # 统一 dtype 到 flow 参数的 dtype，避免 AMP 下 Half/Double 冲突
+
+        """Torch module forward pass."""
+        if self.training:
+            return self.forward_train(traj_feature, noisy_traj_points, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, global_img, best_mode)
+        else:
+            return self.reverse(traj_feature, noisy_traj_points, ego_query, bev_feature, bev_spatial_shape, agents_query, status_encoding, global_img, None)
+        
+    def forward_train(self, 
+                traj_feature,
+                noisy_traj_points, 
+                ego_query, 
+                agents_query, 
+                bev_feature, 
+                bev_spatial_shape, 
+                status_encoding, 
+                global_img=None,
+                best_mode=None):
+        
         dtype = self.blocks[0].proj_in.weight.dtype
 
         if traj_feature is not None:
@@ -319,6 +337,7 @@ class SequenceFlowModel(nn.Module):
         z = poses_reg_list[-1] # 注意这个z是归一化的z，用不了的
         return z, poses_reg_list, logdets, poses_cls_list
 
+
     def reverse(
         self,
         traj_feature: torch.Tensor,                # (B, M, D_traj) 轨迹特征
@@ -336,9 +355,6 @@ class SequenceFlowModel(nn.Module):
         这里仿照 ml-tarflow/transformer_flow.py 中 Model.reverse 的结构：
         - 先用当前估计的 prior 方差 self.var 做缩放
         - 再按 block 逆序依次调用每个 block 的变换
-
-        注意：这里使用 TarDriveMetaBlock 的 forward 作为生成步骤，
-        因此是一个近似的采样过程，而不是严格的数学反变换。
         """
 
         dtype = self.blocks[0].proj_in.weight.dtype
@@ -393,7 +409,7 @@ class SequenceFlowModel(nn.Module):
     def get_loss(self, z: torch.Tensor, logdets: torch.Tensor):
         return 0.5 * z.pow(2).mean() - logdets.mean() #最小化这个函数即可,这个loss太抽象了
 
-
+# 这个block有问题，输出的值太大了
 class TarDriveMetaBlock(nn.Module):
     """TarFlow-style MetaBlock 带 TarDrive 条件输入.
 
@@ -466,8 +482,6 @@ class TarDriveMetaBlock(nn.Module):
         out_dim = in_channels * 2 if nvp else in_channels
         self.proj_out = nn.Linear(channels, out_dim)
         self.proj_out.weight.data.fill_(0.0)
-        nn.init.zeros_(self.proj_out.weight)
-        nn.init.zeros_(self.proj_out.bias)
 
         # 简单的分类头 (沿时间维度的打分)
         self.cls_head = nn.Linear(channels, 1)
@@ -764,9 +778,10 @@ class TarDriveMetaBlock(nn.Module):
             xb = out_last
             xa_raw = torch.zeros_like(xb)
 
-        # forward 中 scale = exp(-xa)，这里为了得到 x_{i+1} = z * exp(a_i) + b_i，
-        # 令 za = -xa_raw，这样 scale = exp(za) 即可。
-        za = -xa_raw
+        # forward 中 scale = exp(-xa)，reverse 里需要用 exp(+xa)
+        # 来实现 x_{i+1} = z * exp(a_i) + b_i，因此这里直接
+        # 返回 xa_raw，保持与 TarFlow MetaBlock.reverse_step 一致。
+        za = xa_raw
         zb = xb
 
         return za, zb
@@ -808,7 +823,7 @@ if __name__ == "__main__":
                 in_channels=C_in,
                 seq_len=T,
                 channels=d_model,
-                num_blocks=2,
+                num_blocks=8,
                 layers_per_block=2,
                 nvp=True,
                 num_classes=0,
@@ -841,7 +856,7 @@ if __name__ == "__main__":
         global_img = None
 
         with torch.no_grad():
-                z, poses_reg_list, logdets, poses_cls_list = flow(
+                z, poses_reg_list, logdets, poses_cls_list = flow.forward_train(
                         traj_feature,
                         noisy_traj_points,
                         ego_query,

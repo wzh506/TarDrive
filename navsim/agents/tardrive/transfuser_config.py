@@ -79,14 +79,20 @@ class TransfuserConfig:
     tf_dropout: float = 0.0
 
 
-
+        # odo_info_fut_x = (odo_info_fut_x + 1)/2 * 56.9 - 1.2
+        # odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
+        # odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
+    
     # Normalizing Flow
     nf_channels: int = 2
     nf_d_model: int = 256
-    nf_num_blocks: int = 4
+    nf_num_blocks: int = 8
     nf_num_layers: int = 2
-    noise_std: float = 0.05
+    noise_std_x: float = 0.01
+    noise_std_y: float = 0.01
+    noise_std_head: float = 0.001 # 角度的噪声要小一些，不然很容易崩溃
     use_mean_det: bool = False
+    use_residual: bool = False
 
     # detection
     num_bounding_boxes: int = 30
@@ -96,9 +102,9 @@ class TransfuserConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 0.0 #这个是TarDrive的特点，监督不了，但是别的可以
     diff_loss_weight: float = 0.0 #没用Diffusion
-    flow_loss_weight: float = 20.0
-    agent_class_weight: float = 10.0
+    flow_loss_weight: float = 1.0 #别给太高容易崩溃这个loss不降反升，可能是因为反向传播的关系，先给个小值，等其他loss降了再调大一点看看
     agent_box_weight: float = 1.0
+    agent_class_weight: float = 10.0
     bev_semantic_weight: float = 14.0
     use_ema: bool = False
     # BEV mapping

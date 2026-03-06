@@ -11,3 +11,4 @@ __pycache__
 /scripts/fig
 /ml-tarflow
 temp.py
+xp_run.sh
